@@ -1,0 +1,9 @@
+[Unit]
+Description=Whisper server for dictate (keeps the model loaded on the GPU)
+
+[Service]
+ExecStart=%h/.local/bin/dictate __server
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

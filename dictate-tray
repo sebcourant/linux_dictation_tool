@@ -1,0 +1,316 @@
+#!/usr/bin/python3
+# dictate-tray — tray icon for dictate: click to start/stop, icon shows the state.
+# Right-click: server start/stop, language, model, recent transcripts.
+import glob
+import os
+import signal
+import socket
+import subprocess
+import sys
+
+from PyQt6.QtCore import QProcess, Qt, QTimer
+from PyQt6.QtGui import QActionGroup, QColor, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+
+DICTATE = os.path.expanduser("~/.local/bin/dictate")
+RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "dictate")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                      "dictate", "config")
+MODEL_DIR = os.path.expanduser("~/.local/share/whisper")
+SERVICE = "dictate-server.service"
+SERVER_PORT = 8178
+POLL_MS = 250
+DEFAULTS = {"LANG_OPT": "auto", "MODEL_NAME": "large-v3"}
+LANGUAGES = [("auto", "Auto-detect"), ("fr", "Français"), ("en", "English")]
+MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin"
+# name, size in bytes, sha256 (from the Hugging Face repo)
+DOWNLOADS = [
+    ("large-v3", 3095033483, "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2"),
+    ("large-v3-turbo", 1624555275, "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"),
+    ("large-v3-q5_0", 1081140203, "d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1"),
+    ("large-v3-turbo-q8_0", 874188075, "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1"),
+    ("large-v3-turbo-q5_0", 574041195, "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"),
+    ("large-v2", 3094623691, "9a423fe4d40c82774b6af34115b8b935f34152246eb19e80e376071d3f999487"),
+    ("medium", 1533763059, "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208"),
+    ("medium-q5_0", 539212467, "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f"),
+    ("small", 487601967, "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"),
+    ("base", 147951465, "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"),
+    ("tiny", 77691713, "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21"),
+]
+# Downloads to .part, checks sha256, then renames so a model only appears once complete
+DOWNLOAD_SH = '''set -e
+trap 'rm -f "$2.part"' ERR
+curl -L --fail -s -o "$2.part" "$1"
+echo "$3  $2.part" | sha256sum -c --status
+mv "$2.part" "$2"'''
+
+STATES = {
+    "idle": (["mic-ready", "audio-input-microphone"], "Dictate — click to start"),
+    "recording": (None, "Dictate — recording, click to stop"),  # red_dot()
+    "busy": (["chronometer", "view-refresh"], "Dictate — transcribing…"),
+}
+
+
+def icon(names):
+    for name in names:
+        if QIcon.hasThemeIcon(name):
+            return QIcon.fromTheme(name)
+    return QIcon.fromTheme(names[-1])
+
+
+def red_dot():
+    # Drawn rather than themed so it stays red on monochrome panel themes
+    icon = QIcon()
+    for size in (16, 22, 24, 32, 48, 64):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        ring = max(1.0, size / 16)
+        p.setPen(QPen(QColor("white"), ring))
+        p.setBrush(QColor("#e53935"))
+        m = ring / 2 + size * 0.06
+        p.drawEllipse(int(m), int(m), int(size - 2 * m), int(size - 2 * m))
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
+
+def alive(pidfile):
+    try:
+        with open(os.path.join(RUNDIR, pidfile)) as f:
+            os.kill(int(f.read().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def current_state():
+    if alive("rec.pid"):
+        return "recording"
+    if alive("busy.pid"):
+        return "busy"
+    return "idle"
+
+
+def toggle():
+    subprocess.Popen([DICTATE], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def read_config():
+    """All KEY=value pairs, so keys the tray doesn't manage (e.g. PROMPT) survive a write."""
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                key, sep, val = line.rstrip("\n").partition("=")
+                if sep:
+                    cfg[key] = val
+    except OSError:
+        pass
+    return cfg
+
+
+def write_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(f"{k}={v}\n" for k, v in cfg.items())
+    os.replace(tmp, CONFIG)
+
+
+def models():
+    names = [os.path.basename(p)[len("ggml-"):-len(".bin")]
+             for p in glob.glob(os.path.join(MODEL_DIR, "ggml-*.bin"))]
+    return sorted(names)
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+
+
+def server_state():
+    if systemctl("is-active", "--quiet", SERVICE).returncode != 0:
+        return "stopped"
+    try:
+        with socket.create_connection(("127.0.0.1", SERVER_PORT), timeout=0.2):
+            return "ready"
+    except OSError:
+        return "loading"
+
+
+def history():
+    try:
+        with open(os.path.join(RUNDIR, "history")) as f:
+            return [line.rstrip("\n") for line in f if line.strip()][::-1]
+    except OSError:
+        return []
+
+
+def copy(text):
+    subprocess.run(["wl-copy"], input=text, text=True)
+    subprocess.Popen(["notify-send", "-a", "Dictate", "-t", "1500", "📋 Copied", text[:120]])
+
+
+def notify(title, body=""):
+    subprocess.Popen(["notify-send", "-a", "Dictate", title, body])
+
+
+def human(size):
+    return f"{size / 1e9:.1f} GB" if size >= 1e9 else f"{size / 1e6:.0f} MB"
+
+
+def label(text, width=60):
+    text = text if len(text) <= width else text[:width - 1] + "…"
+    return text.replace("&", "&&")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("dictate-tray")
+    app.setQuitOnLastWindowClosed(False)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    icons = {k: icon(names) if names else red_dot() for k, (names, _) in STATES.items()}
+    tray = QSystemTrayIcon(icons["idle"])
+    tray.setToolTip(STATES["idle"][1])
+
+    menu = QMenu()
+    toggle_action = menu.addAction("Start dictation")
+    toggle_action.triggered.connect(toggle)
+    menu.addSeparator()
+
+    server_action = menu.addAction("")
+
+    def toggle_server():
+        if server_state() == "stopped":
+            systemctl("enable", "--now", SERVICE)
+        else:
+            systemctl("disable", "--now", SERVICE)
+
+    server_action.triggered.connect(toggle_server)
+
+    lang_menu = menu.addMenu("Language")
+    lang_group = QActionGroup(lang_menu)
+    lang_actions = {}
+    for code, name in LANGUAGES:
+        a = lang_menu.addAction(name)
+        a.setCheckable(True)
+        a.setActionGroup(lang_group)
+        a.triggered.connect(lambda _=False, c=code: set_option("LANG_OPT", c))
+        lang_actions[code] = a
+
+    model_menu = menu.addMenu("Model")
+    model_group = None
+    download_menu = model_menu.addMenu("Download")
+    downloads = {}   # name -> running QProcess
+
+    def download(name, sha):
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        proc = QProcess()
+        downloads[name] = proc
+
+        def done(code, _status):
+            del downloads[name]
+            if code == 0:
+                notify("✅ Model ready", f"{name} is now in the Model menu")
+            else:
+                notify("❌ Download failed", name)
+
+        proc.finished.connect(done)
+        proc.start("bash", ["-c", DOWNLOAD_SH, "_", MODEL_URL.format(name),
+                            os.path.join(MODEL_DIR, f"ggml-{name}.bin"), sha])
+        notify("⬇ Downloading model", name)
+
+    history_menu = menu.addMenu("History")
+    menu.addSeparator()
+    menu.addAction("Quit").triggered.connect(app.quit)
+
+    def set_option(key, value):
+        cfg = read_config()
+        if cfg.get(key) == value:
+            return
+        cfg[key] = value
+        write_config(cfg)
+        if key == "MODEL_NAME" and server_state() != "stopped":
+            systemctl("restart", SERVICE)
+
+    def refresh_menu():
+        nonlocal model_group
+        cfg = read_config()
+        state = server_state()
+        if state == "stopped":
+            server_action.setText("Start server — keeps model loaded, faster")
+            server_action.setIcon(QIcon.fromTheme("media-playback-start"))
+        else:
+            server_action.setText("Stop server — running" if state == "ready"
+                                  else "Stop server — loading model…")
+            server_action.setIcon(QIcon.fromTheme("media-playback-stop"))
+
+        for code, a in lang_actions.items():
+            a.setChecked(code == cfg["LANG_OPT"])
+
+        model_menu.clear()
+        if model_group:
+            model_group.deleteLater()
+        model_group = QActionGroup(model_menu)
+        for name in models():
+            a = model_menu.addAction(name)
+            a.setCheckable(True)
+            a.setActionGroup(model_group)
+            a.setChecked(name == cfg["MODEL_NAME"])
+            a.triggered.connect(lambda _=False, n=name: set_option("MODEL_NAME", n))
+        model_menu.addSeparator()
+        model_menu.addMenu(download_menu)
+
+        download_menu.clear()
+        installed = set(models())
+        for name, size, sha in DOWNLOADS:
+            if name in installed:
+                continue
+            if name in downloads:
+                download_menu.addAction(f"{name} — downloading…").setEnabled(False)
+            else:
+                download_menu.addAction(f"{name} — {human(size)}").triggered.connect(
+                    lambda _=False, n=name, h=sha: download(n, h))
+        if download_menu.isEmpty():
+            download_menu.addAction("(all installed)").setEnabled(False)
+
+        history_menu.clear()
+        entries = history()
+        for text in entries:
+            history_menu.addAction(label(text)).triggered.connect(lambda _=False, t=text: copy(t))
+        if not entries:
+            history_menu.addAction("(empty)").setEnabled(False)
+
+    menu.aboutToShow.connect(refresh_menu)
+    refresh_menu()
+    tray.setContextMenu(menu)
+
+    tray.activated.connect(
+        lambda reason: toggle() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+
+    last = None
+
+    def refresh():
+        nonlocal last
+        state = current_state()
+        if state == last:
+            return
+        last = state
+        tray.setIcon(icons[state])
+        tray.setToolTip(STATES[state][1])
+        toggle_action.setText("Stop dictation" if state == "recording" else "Start dictation")
+
+    timer = QTimer()
+    timer.timeout.connect(refresh)
+    timer.start(POLL_MS)
+    refresh()
+
+    tray.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

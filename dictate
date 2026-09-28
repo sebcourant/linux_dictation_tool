@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# dictate — toggle voice dictation into the focused field.
+# First run starts recording, second run stops it; the text is then transcribed and typed.
+# Uses dictate-server.service when it is up (model already loaded), otherwise whisper-cli.
+set -uo pipefail
+
+WHISPER_DIR="$HOME/.local/src/whisper.cpp/build/bin"
+MODEL_DIR="$HOME/.local/share/whisper"
+MODEL_NAME="large-v3"                 # ggml-<name>.bin in MODEL_DIR
+LANG_OPT="auto"                       # auto | fr | en
+PROMPT=""                             # vocabulary hint, e.g. product names and jargon
+MAX_SECS=120                          # recording auto-stops after this
+# Interjections stripped from transcripts (FR + EN)
+FILLERS='um+|uh+|uhm+|er|err|erm|hm+|mm+|mhm|mmh|ahem|ah+|eh|huh|oh|euh|heu|hein|ben|bah|bof|hum+'
+HISTORY_MAX=10
+SERVER_PORT=8178
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/dictate/config"
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}/dictate"
+WAV="$RUNDIR/rec.wav"
+PIDFILE="$RUNDIR/rec.pid"             # recorder pid while recording
+BUSYFILE="$RUNDIR/busy.pid"           # session pid while transcribing
+IDFILE="$RUNDIR/notify.id"
+HISTFILE="$RUNDIR/history"            # recent transcripts, one per line, newest last
+export YDOTOOL_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket"
+
+# Config overrides (KEY=value); unknown keys and invalid values are ignored
+if [[ -f "$CONFIG" ]]; then
+  while IFS='=' read -r key val; do
+    case "$key" in
+      LANG_OPT)   [[ "$val" =~ ^(auto|fr|en)$ ]] && LANG_OPT="$val" ;;
+      MODEL_NAME) [[ "$val" =~ ^[A-Za-z0-9._-]+$ && -f "$MODEL_DIR/ggml-$val.bin" ]] && MODEL_NAME="$val" ;;
+      PROMPT)     PROMPT="$val" ;;
+    esac
+  done < "$CONFIG"
+fi
+MODEL="$MODEL_DIR/ggml-$MODEL_NAME.bin"
+SERVER_URL="http://127.0.0.1:$SERVER_PORT"
+
+mkdir -p "$RUNDIR"
+
+notify()      { command -v notify-send >/dev/null 2>&1 && notify-send -a Dictate "$@" || true; }
+notify_repl() { # replaces the recording notification
+  local id; id="$(cat "$IDFILE" 2>/dev/null || echo 0)"
+  command -v notify-send >/dev/null 2>&1 && notify-send -a Dictate -r "${id:-0}" "$@" || true
+}
+
+server_up() { curl -s --noproxy '*' -m 0.3 -o /dev/null "$SERVER_URL/"; }
+
+# Matches transcribe_cli: beam search 5/5 is set at server start, no timestamp tokens
+transcribe_server() {
+  curl -sf --noproxy '*' -m 300 "$SERVER_URL/inference" \
+    -F file=@"$WAV" -F response_format=text -F no_timestamps=true \
+    --form-string language="$LANG_OPT" --form-string prompt="$PROMPT"
+}
+
+transcribe_cli() {
+  "$WHISPER_DIR/whisper-cli" -m "$MODEL" -f "$WAV" -l "$LANG_OPT" --prompt "$PROMPT" -nt -np 2>/dev/null
+}
+
+transcribe_and_type() {
+  notify_repl -t 1500 "📝 Transcribing…"
+  local RAW="" used_server=0
+  if server_up && RAW="$(transcribe_server)" && [[ "$RAW" != '{"error"'* ]]; then
+    used_server=1
+  else
+    RAW="$(transcribe_cli)"
+  fi
+  rm -f "$WAV"
+  # The server's results drift after its first request, so each request gets a fresh one
+  (( used_server )) && systemctl --user --no-block try-restart dictate-server.service
+
+  local TEXT
+  TEXT="$(printf '%s' "$RAW" \
+    | tr '\n' ' ' \
+    | sed -E "s/\\b(${FILLERS})\\b[,.]?//gI" \
+    | sed -E 's/\b([[:alpha:]]+)( \1\b)+/\1/gI' \
+    | sed -E 's/[[:space:]]+/ /g; s/ +([,.!?;:])/\1/g; s/(, *)+/, /g; s/^[[:space:],.;:!?-]+//; s/[[:space:],;:]+$//' \
+    | sed -E 's/^(.)/\U\1/')"
+  if [[ -z "$TEXT" || "$TEXT" == "[BLANK_AUDIO]" || "$TEXT" == "(silence)" ]]; then
+    notify -t 1500 "🔇 Nothing transcribed"
+    return 0
+  fi
+
+  printf '%s\n' "$TEXT" >> "$HISTFILE"
+  tail -n "$HISTORY_MAX" "$HISTFILE" > "$HISTFILE.tmp" && mv "$HISTFILE.tmp" "$HISTFILE"
+
+  # ydotool type only produces ASCII; anything else is pasted from the clipboard
+  if printf '%s' "$TEXT" | LC_ALL=C grep -q '[^ -~]'; then
+    printf '%s' "$TEXT" | wl-copy
+    sleep 0.05
+    ydotool key 29:1 47:1 47:0 29:0   # Ctrl+V
+  else
+    ydotool type -- "$TEXT"
+  fi
+}
+
+# Detached so transcription finishes even if the stop press is missed
+run_session() {
+  rm -f "$WAV"
+  local id
+  id="$(notify-send -p -a Dictate -t 0 "🎙 Recording…" "press again to stop (auto-stops at ${MAX_SECS}s)" 2>/dev/null || echo 0)"
+  echo "${id:-0}" > "$IDFILE"
+
+  parecord --rate=16000 --channels=1 --format=s16le --file-format=wav "$WAV" &
+  local rec=$!
+  echo "$rec" > "$PIDFILE"
+
+  local i
+  for ((i = 0; i < MAX_SECS * 10; i++)); do
+    kill -0 "$rec" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -INT "$rec" 2>/dev/null || true
+  wait "$rec" 2>/dev/null || true
+  echo "$$" > "$BUSYFILE"
+  rm -f "$PIDFILE"
+
+  transcribe_and_type
+  rm -f "$BUSYFILE"
+}
+
+case "${1:-}" in
+  __session)
+    run_session
+    exit 0 ;;
+  __server)   # ExecStart of dictate-server.service
+    exec "$WHISPER_DIR/whisper-server" -m "$MODEL" --host 127.0.0.1 --port "$SERVER_PORT" \
+      -l auto -bs 5 -bo 5 ;;
+esac
+
+if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill -INT "$(cat "$PIDFILE")" 2>/dev/null || true
+else
+  setsid "$0" __session >/dev/null 2>&1 < /dev/null &
+fi
